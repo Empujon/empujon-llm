@@ -1,4 +1,4 @@
-"""Google Gemini provider using google-genai SDK."""
+"""Google Gemini provider — supports both google-genai (new) and google-generativeai (legacy)."""
 
 import os
 from typing import Any, Dict, List, Optional
@@ -9,12 +9,21 @@ from empujon_llm.types import (
 )
 from empujon_llm.providers import LLMProviderBase
 
+# Try new SDK first, fall back to legacy
+_USE_NEW_SDK = False
+genai = None
+genai_types = None
+genai_legacy = None
+
 try:
     from google import genai
     from google.genai import types as genai_types
+    _USE_NEW_SDK = True
 except ImportError:
-    genai = None
-    genai_types = None
+    try:
+        import google.generativeai as genai_legacy
+    except ImportError:
+        pass
 
 
 class GeminiProvider(LLMProviderBase):
@@ -26,15 +35,19 @@ class GeminiProvider(LLMProviderBase):
     ]
 
     def __init__(self, api_key: Optional[str] = None, timeout_ms: int = 120_000):
-        if not genai:
+        if not genai and not genai_legacy:
             raise ProviderNotAvailableException(
-                "google-genai package not installed. Run: pip install google-genai",
+                "Neither google-genai nor google-generativeai installed. Run: pip install google-genai",
                 "gemini", "unknown",
             )
         self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
             raise LLMException("GEMINI_API_KEY not set", "gemini", "unknown")
-        self.client = genai.Client(api_key=self.api_key, http_options={"timeout": timeout_ms})
+        self._use_new_sdk = _USE_NEW_SDK
+        if self._use_new_sdk:
+            self.client = genai.Client(api_key=self.api_key, http_options={"timeout": timeout_ms})
+        else:
+            genai_legacy.configure(api_key=self.api_key)
 
     def supports_model(self, model: str) -> bool:
         m = (model or "").lower()
@@ -104,10 +117,53 @@ class GeminiProvider(LLMProviderBase):
             "total_tokens": um.total_token_count,
         }
 
+    # ── legacy SDK helpers ──
+
+    def _build_legacy_config(self, request: LLMRequest) -> dict:
+        config = {}
+        if request.temperature is not None:
+            config["temperature"] = request.temperature
+        if request.max_tokens:
+            config["max_output_tokens"] = request.max_tokens
+        if request.top_p is not None:
+            config["top_p"] = request.top_p
+        return config
+
+    def _legacy_call(self, request: LLMRequest) -> LLMResponse:
+        """Call using google-generativeai (legacy SDK)."""
+        system_msg = next((m.content for m in request.messages if m.role in ("system", "developer")), None)
+        user_msgs = [m.content for m in request.messages if m.role not in ("system", "developer")]
+        prompt = "\n".join(user_msgs)
+
+        model_kwargs = {}
+        if system_msg:
+            model_kwargs["system_instruction"] = system_msg
+
+        model = genai_legacy.GenerativeModel(request.model, **model_kwargs)
+        gen_config = self._build_legacy_config(request)
+        response = model.generate_content(prompt, generation_config=gen_config)
+        text = response.text
+
+        usage = {}
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            um = response.usage_metadata
+            usage = {
+                "prompt_tokens": getattr(um, "prompt_token_count", None),
+                "completion_tokens": getattr(um, "candidates_token_count", None),
+                "total_tokens": getattr(um, "total_token_count", None),
+            }
+
+        return LLMResponse(content=text, model=request.model, provider="gemini", usage=usage, raw_response=response)
+
     # ── async ──
 
     async def chat_async(self, request: LLMRequest) -> LLMResponse:
         try:
+            if not self._use_new_sdk:
+                # Legacy SDK has no native async — run in executor
+                import asyncio
+                return await asyncio.get_event_loop().run_in_executor(None, self._legacy_call, request)
+
             config_params, contents = self._build_config(request)
             response = await self.client.aio.models.generate_content(
                 model=request.model,
@@ -128,6 +184,9 @@ class GeminiProvider(LLMProviderBase):
 
     def chat_sync(self, request: LLMRequest) -> LLMResponse:
         try:
+            if not self._use_new_sdk:
+                return self._legacy_call(request)
+
             config_params, contents = self._build_config(request)
             response = self.client.models.generate_content(
                 model=request.model,
