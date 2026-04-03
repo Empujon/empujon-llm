@@ -196,6 +196,37 @@ class LLMMultiplexer:
         return provider_instance.chat_sync(request)
 
 
+    # ── Embeddings API (stub — to be implemented for UH migration) ──
+
+    def embed(
+        self,
+        model: str,
+        text: str,
+        provider: LLMProvider = LLMProvider.AUTO,
+    ) -> list:
+        """Generate embedding vector for text.
+
+        TODO: Implement when migrating UH to empujon-llm.
+        UH uses OpenAI text-embedding-3-large for semantic similarity
+        in temporal_fact_extractor.py and invalidation_agent.py.
+
+        Args:
+            model: Embedding model (e.g. "text-embedding-3-large")
+            text: Text to embed
+            provider: Provider to use (AUTO detects from model name)
+
+        Returns:
+            List of floats (embedding vector)
+        """
+        raise NotImplementedError(
+            "embed() not yet implemented. See empujon-llm plan for UH migration."
+        )
+
+    async def embed_async(self, model: str, text: str, provider: LLMProvider = LLMProvider.AUTO) -> list:
+        """Async version of embed(). TODO: implement for UH migration."""
+        raise NotImplementedError("embed_async() not yet implemented.")
+
+
 def create_llm_multiplexer(**kwargs) -> LLMMultiplexer:
     """Create and return a configured LLM multiplexer instance."""
     return LLMMultiplexer(**kwargs)
