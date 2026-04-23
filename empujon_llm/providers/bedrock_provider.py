@@ -1,8 +1,9 @@
-"""AWS Bedrock provider — Claude (Messages API), Titan, Llama, Mistral, AI21."""
+"""AWS Bedrock provider — Claude (Messages API), Titan, DeepSeek, Llama, Mistral, AI21."""
 
 import asyncio
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from empujon_llm.types import (
@@ -17,10 +18,18 @@ except ImportError:
     boto3 = None
 
 
+# DeepSeek-R1 emits reasoning wrapped in <think>...</think> before the final
+# answer. We strip it so callers get clean output consistent with other models.
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
 class BedrockProvider(LLMProviderBase):
     """AWS Bedrock provider — uses Messages API for Claude 3+."""
 
-    SUPPORTED_MODELS = ["claude", "anthropic", "titan", "llama", "mistral", "ai21"]
+    SUPPORTED_MODELS = [
+        "claude", "anthropic", "titan", "deepseek",
+        "llama", "mistral", "ai21",
+    ]
 
     def __init__(self, region: Optional[str] = None):
         if not boto3:
@@ -100,11 +109,109 @@ class BedrockProvider(LLMProviderBase):
             },
         }
 
+    # ── DeepSeek ──
+    #   R1:   prompt-based (flat string), emits <think> reasoning.
+    #   V3.1 and V3.2: messages-based (OpenAI-like chat schema).
+
+    def _format_for_deepseek_r1(self, request: LLMRequest) -> Dict[str, Any]:
+        """Flat prompt body used by DeepSeek-R1 on Bedrock."""
+        system_texts: List[str] = []
+        turns: List[str] = []
+        for msg in request.messages:
+            if msg.role in ("system", "developer"):
+                system_texts.append(msg.content)
+            elif msg.role == "assistant":
+                turns.append(f"Assistant: {msg.content}")
+            else:
+                turns.append(f"User: {msg.content}")
+
+        parts: List[str] = []
+        if system_texts:
+            parts.append("\n\n".join(system_texts))
+        if turns:
+            parts.append("\n".join(turns))
+        parts.append("Assistant:")
+        prompt = "\n\n".join(p for p in parts if p)
+
+        body: Dict[str, Any] = {
+            "prompt": prompt,
+            "max_tokens": request.max_tokens or 1024,
+        }
+        if request.temperature is not None:
+            body["temperature"] = request.temperature
+        if request.top_p is not None:
+            body["top_p"] = request.top_p
+        return body
+
+    def _format_for_deepseek_v3(self, request: LLMRequest) -> Dict[str, Any]:
+        """OpenAI-style messages body used by DeepSeek-V3.x on Bedrock."""
+        messages: List[Dict[str, str]] = []
+        for msg in request.messages:
+            role = msg.role
+            if role == "developer":
+                role = "system"
+            if role not in ("system", "user", "assistant"):
+                role = "user"
+            messages.append({"role": role, "content": msg.content})
+        if not messages:
+            messages = [{"role": "user", "content": ""}]
+
+        body: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": request.max_tokens or 1024,
+        }
+        if request.temperature is not None:
+            body["temperature"] = request.temperature
+        if request.top_p is not None:
+            body["top_p"] = request.top_p
+        return body
+
+    def _parse_deepseek_response(self, response_body: Dict[str, Any]) -> tuple:
+        """Parse DeepSeek response (both R1 and V3.x shapes), strip <think> blocks."""
+        text = ""
+        choices = response_body.get("choices") or []
+        if choices:
+            first = choices[0]
+            # R1: {"text": "..."}     V3.x: {"message": {"content": "..."}}
+            text = first.get("text") or (first.get("message") or {}).get("content") or ""
+        if not text:
+            text = response_body.get("generation") or response_body.get("output") or ""
+
+        if isinstance(text, str) and text:
+            text = _THINK_TAG_RE.sub("", text).strip()
+
+        usage = response_body.get("usage") or {}
+        usage_dict = None
+        if usage:
+            prompt_tokens = (
+                usage.get("prompt_tokens")
+                or usage.get("input_tokens")
+                or usage.get("prompt_token_count")
+            )
+            completion_tokens = (
+                usage.get("completion_tokens")
+                or usage.get("output_tokens")
+                or usage.get("generation_token_count")
+            )
+            usage_dict = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": (prompt_tokens or 0) + (completion_tokens or 0),
+            }
+        return text, usage_dict
+
     # ── Dispatch ──
 
     def _is_claude(self, model: str) -> bool:
         m = model.lower()
         return "claude" in m or "anthropic" in m
+
+    def _is_deepseek(self, model: str) -> bool:
+        return "deepseek" in model.lower()
+
+    def _is_deepseek_r1(self, model: str) -> bool:
+        m = model.lower()
+        return "deepseek" in m and ".r1" in m
 
     async def chat_async(self, request: LLMRequest) -> LLMResponse:
         return await asyncio.get_event_loop().run_in_executor(None, self.chat_sync, request)
@@ -120,6 +227,19 @@ class BedrockProvider(LLMProviderBase):
                 )
                 response_body = json.loads(response["body"].read())
                 content, usage = self._parse_claude_response(response_body)
+
+            elif self._is_deepseek(request.model):
+                if self._is_deepseek_r1(request.model):
+                    body = self._format_for_deepseek_r1(request)
+                else:
+                    body = self._format_for_deepseek_v3(request)
+                response = self.client.invoke_model(
+                    modelId=request.model,
+                    body=json.dumps(body),
+                    contentType="application/json",
+                )
+                response_body = json.loads(response["body"].read())
+                content, usage = self._parse_deepseek_response(response_body)
 
             elif "titan" in request.model.lower():
                 body = self._format_for_titan(request)
